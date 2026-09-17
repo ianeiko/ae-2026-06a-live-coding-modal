@@ -32,10 +32,13 @@ half to ship.
 4. **Run it** (§4) — `uv run modal run main.py`.
 5. **Read the dashboard** (§5) — where the 404 trap lives.
 6. **Deploy it** (§6) — `uv run modal deploy main.py`, then call it.
+7. **Put a model on it** (§7) — optional, and the first part that costs money.
 
 `bash scripts/check.sh` tells you where you are at any point.
 
-Fifteen minutes, no card, no cloud project, no YAML.
+Fifteen minutes, no card, no cloud project, no YAML. That holds through §6.
+**§7 runs on GPUs and bills by the second** — read its cost table before you run
+anything in it.
 
 ## 1. Account
 
@@ -197,7 +200,92 @@ uv run modal app stop example-get-started        # tear it down
 
 Stopping is destructive and one-way — a stopped app can't be restarted, you
 redeploy instead. Nothing here costs anything on the free tier, so leaving it up
-is fine too.
+is fine too. (That stops being true in §7.)
+
+## 7. Put a model on it
+
+Everything so far ran on a CPU and was free. This section is neither. Read the
+cost table before you type anything.
+
+`square` needed no dependencies and no hardware. A language model needs both, so
+three new pieces show up — and that is the whole lesson of this section:
+
+| Piece | What it's for |
+| --- | --- |
+| `modal.Image` | the container: pip installs, env vars. Built once, cached. |
+| `modal.Volume` | a disk that outlives the container — model weights go here |
+| `@app.cls` + `@modal.enter()` | load the model **once per container**, not once per call |
+
+That last one is the important one. `@modal.enter()` runs when a container
+starts; the method decorated with `@modal.method()` runs per request. Put the
+weight loading in the wrong one and you pay for it on every single call.
+
+### The small one — run this
+
+[`llm_demo.py`](llm_demo.py) serves Qwen2.5-1.5B-Instruct on one L4:
+
+```bash
+uv run modal run llm_demo.py
+```
+
+~3GB of weights, ungated (no Hugging Face token), cold-starts in a minute or
+two. Run it twice — the second run is much faster, because the container is
+still warm and the volume already holds the weights.
+
+### The big one — read this
+
+[`deepseek_v4_flash.py`](deepseek_v4_flash.py) is the same file with four values
+changed: model id, `gpu=`, `tensor_parallel_size`, and a longer timeout. That is
+the point — scaling up is config, not a rewrite.
+
+What it's running:
+
+| | DeepSeek-V4-Flash |
+| --- | --- |
+| Params | 284B total, **13B activated** (mixture-of-experts) |
+| Weights on disk | **160GB**, FP4 + FP8 mixed |
+| Context | 1M tokens |
+| License | MIT, open weights |
+
+The 13B *activated* count is what makes it fast. It is not what makes it fit —
+all 284B parameters sit in VRAM, so you need at least two H200s. Download the
+weights before you ever start a GPU:
+
+```bash
+uv run modal run deepseek_v4_flash.py::download    # CPU-only, ~160GB, run once
+uv run modal run deepseek_v4_flash.py --prompt "..."
+```
+
+`download()` deliberately has no `gpu=`. Pulling 160GB while two H200s idle
+would cost several dollars to do nothing but wait on I/O.
+
+### What it costs
+
+Modal bills per second from container start to scaledown, so **cold start and
+idle dominate the bill**, not generation. At list prices:
+
+| | Hardware | Rate | One cold run | One hour |
+| --- | --- | --- | --- | --- |
+| `llm_demo.py` | 1× L4 | $0.80/h | ~$0.11 | $0.80 |
+| `deepseek_v4_flash.py` | 2× H200 | $9.08/h | ~$2.90 | $9.08 |
+
+2× H200 is the cheapest configuration that fits 160GB. For comparison: 2× B200
+is $12.50/h, 3× H200 is $13.62/h, 4× H100 is $15.80/h.
+
+Two costs that aren't in that table: the volume holds 160GB **and bills monthly
+whether or not you run anything** (delete it when you're done — `uv run modal
+volume delete hf-cache`), and the `download()` function bills at CPU rates.
+
+### The trap
+
+`scaledown_window=600` on the DeepSeek class means **ten minutes at $9.08/h
+after every call**, including the calls where you stopped to explain something.
+It's set high on purpose, because reloading 160GB is worse than idling. But it
+means a forgotten container overnight is about **$109**.
+
+If you're demoing live, drop it to `120` and eat the reload, and add
+`max_containers=1` so a stray second invocation can't quietly double your rate.
+Check what's alive with `uv run modal app list`.
 
 ## What you actually learned
 
@@ -210,6 +298,11 @@ is fine too.
 | `modal deploy` | persistent — named, callable later |
 | `Function.from_name(...)` | grab a handle to a deployed function from anywhere |
 | `main` in the URL | your *environment*, not your branch |
+| `modal.Image` | the container your function runs in — built once, cached |
+| `modal.Volume` | a disk that survives the container; where weights live |
+| `@modal.enter()` | once per container, not once per call — put loading here |
+| `gpu="H200:2"` | hardware as a string; `:N` is the count |
+| `scaledown_window` | how long an idle container stays alive, billing |
 
 The `main` in `modal.com/apps/<workspace>/main/...` is Modal's default
 environment — a namespace for deployed apps, so staging and prod can hold the
@@ -276,3 +369,7 @@ The token from §3 lands in `%USERPROFILE%\.modal.toml`.
 | Modal rejects the Python version | this repo pins 3.14 in `.python-version`, and Modal matches your local minor version remotely | pin the remote side instead: give the function an image with `python_version="3.13"` |
 | Deployed function `NotFoundError` from `from_name` | name mismatch or wrong workspace | the app name is `example-get-started` (in `main.py`), the function is `square`; check `uv run modal app list` |
 | Second `modal deploy` — did it duplicate? | no | deploy is idempotent per app name; it replaces |
+| §7 cold start takes minutes every time | weights are re-downloading; the volume isn't being hit | run `::download` first; check the `volumes=` path matches `HF_HOME` |
+| CUDA out of memory on the DeepSeek model | `max_model_len` too high — 1M context allocates an enormous KV cache | keep it at 8192 and raise it only when you need long context, adding GPUs as you do |
+| A GPU run cost more than you expected | `scaledown_window` kept an idle container alive | §7 — "The trap"; `uv run modal app list` shows what's still up |
+| `gpu="A10G"` is rejected | Modal's name is `A10` | valid: `T4`, `L4`, `A10`, `L40S`, `A100-40GB`, `A100-80GB`, `H100`, `H200`, `B200`, `B300` |
