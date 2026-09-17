@@ -1,0 +1,9 @@
+[project]
+name = "ae-2026-06a-live-coding-modal"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "modal>=1.5.5",
+]
